@@ -36,24 +36,36 @@ import MapView from "@/components/MapView";
 
 export default function Home() {
   const [activeTab, setActiveTab] = React.useState("map");
-  const [viewMode, setViewMode] = React.useState<
-    "points" | "heatmap" | "cluster"
-  >("points");
-  const [colorBy, setColorBy] = useState<"signal" | "type" | "security">(
-    "signal"
+  const [viewMode, setViewMode] = React.useState<"points" | "cluster">(
+    "points"
   );
+  const NETWORK_SURVEY_ITEMS = [
+    { key: "wifi", label: "Wi-Fi", char: "WI", defaultEnabled: false },
+    { key: "bluetooth", label: "Bluetooth", char: "BT", defaultEnabled: false },
+    { key: "lte", label: "LTE", char: "LT", defaultEnabled: false },
+    { key: "nr", label: "5G (NR)", char: "5G", defaultEnabled: false },
+    { key: "gsm", label: "GSM", char: "GS", defaultEnabled: false },
+    { key: "cdma", label: "CDMA", char: "CD", defaultEnabled: false },
+    { key: "gnss", label: "GPS (GNSS)", char: "GN", defaultEnabled: false },
+    // Phone state only if your backend supports it (otherwise keep disabled in UI)
+    { key: "phone", label: "Phone State", char: "PH", defaultEnabled: false },
+  ];
+  const [timeRange, setTimeRange] = React.useState({
+    start: "2025-12-19T00:00:00Z",
+    end: "2025-12-20T00:00:00Z",
+  });
 
   const tabs = [
     { id: "map", label: "Map", icon: <MyLocationIcon fontSize="small" /> },
     { id: "table", label: "Table", icon: <GridOnIcon fontSize="small" /> },
     { id: "history", label: "History", icon: <HistoryIcon fontSize="small" /> },
   ];
-  const [enabledLayers, setEnabledLayers] = useState<Record<string, boolean>>({
-    wifi: false,
-    lte: false,
-    bluetooth: false,
-    gnss: false,
-  });
+  const [enabledLayers, setEnabledLayers] = useState<Record<string, boolean>>(
+    Object.fromEntries(
+      NETWORK_SURVEY_ITEMS.map((i) => [i.key, i.defaultEnabled])
+    )
+  );
+  const activeChips = NETWORK_SURVEY_ITEMS.filter((i) => enabledLayers[i.key]);
 
   const handleSwitchChange = (key: string) => {
     setEnabledLayers((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -286,7 +298,6 @@ export default function Home() {
             >
               {[
                 { id: "points", label: "Points" },
-                { id: "heatmap", label: "Heatmap" },
                 { id: "cluster", label: "Cluster" },
               ].map((mode) => (
                 <Button
@@ -313,68 +324,22 @@ export default function Home() {
             </Box>
           </Box>
 
-          <Box>
-            <Typography sx={{ fontSize: 14, color: "#94a3b8", mb: 1 }}>
-              Color By
-            </Typography>
-
-            <Box sx={{ display: "flex", gap: 1 }}>
-              {["signal", "type", "security"].map((mode) => (
-                <Button
-                  key={mode}
-                  onClick={() => setColorBy(mode as any)}
-                  variant={colorBy === mode ? "contained" : "outlined"}
-                  size="small"
-                  sx={{ fontSize: 11, flex: 1 }}
-                >
-                  {mode.toUpperCase()}
-                </Button>
-              ))}
-            </Box>
-          </Box>
-
           {/* CELLULAR */}
           <Box>
             <Box
               sx={{ display: "flex", justifyContent: "space-between", mb: 1 }}
             >
-              <Typography sx={{ fontSize: 16 }}>Cellular</Typography>
+              <Typography sx={{ fontSize: 16 }}>Network Survey</Typography>
               <Typography sx={{ fontSize: 14, color: "#94a3b8" }}>
-                7/7
+                {
+                  NETWORK_SURVEY_ITEMS.filter((i) => enabledLayers[i.key])
+                    .length
+                }
+                /{NETWORK_SURVEY_ITEMS.length}
               </Typography>
             </Box>
-            {[
-              {
-                key: "wifi",
-                label: "WiFi Networks",
-                char: "WI",
-                defaultEnabled: true,
-              },
-              {
-                key: "lte",
-                label: "LTE Cellular",
-                char: "LT",
-                defaultEnabled: false,
-              },
-              {
-                key: "bluetooth",
-                label: "Bluetooth",
-                char: "BT",
-                defaultEnabled: true,
-              },
-              {
-                key: "gnss",
-                label: "GNSS Satellites",
-                char: "GP",
-                defaultEnabled: false,
-              },
-              {
-                key: "phone",
-                label: "Phone State",
-                char: "PH",
-                defaultEnabled: false,
-              },
-            ].map((item) => (
+
+            {NETWORK_SURVEY_ITEMS.map((item) => (
               <Box
                 key={item.key}
                 sx={{ display: "flex", justifyContent: "space-between", mb: 1 }}
@@ -392,15 +357,16 @@ export default function Home() {
                   </Avatar>
                   <Typography sx={{ fontSize: 14 }}>{item.label}</Typography>
                 </Box>
+
                 <Switch
                   size="small"
-                  checked={enabledLayers[item.key]}
+                  checked={!!enabledLayers[item.key]}
                   onChange={() => handleSwitchChange(item.key)}
                 />
               </Box>
             ))}
           </Box>
-     
+
           <Divider sx={{ borderColor: "#1e293b" }} />
           {/* BASE LAYERS + OVERLAYS */}
           {["Base Layers", "Overlays"].map((label) => (
@@ -416,53 +382,35 @@ export default function Home() {
 
         {/* MAP AREA */}
         <Box sx={{ flex: 1, position: "relative" }}>
-          {/* Chips Row
+          {/* Chips Row */}
           <Box
             sx={{
               position: "absolute",
               top: 10,
-              left: 300,
+              left: 230,
               zIndex: 10,
               display: "flex",
               gap: 1,
             }}
           >
-            <Chip
-              size="small"
-              label="SwiftTitan"
-              color="warning"
-              sx={{
-                "& .MuiChip-label": {
-                  fontSize: 10,
-                },
-              }}
-            />
-            <Chip
-              size="small"
-              label="Co-Traveler"
-              color="warning"
-              sx={{
-                "& .MuiChip-label": {
-                  fontSize: 10,
-                },
-              }}
-            />
-            <Chip
-              size="small"
-              label="Shadow WiFi"
-              color="success"
-              sx={{
-                "& .MuiChip-label": {
-                  fontSize: 10,
-                },
-              }}
-            />
-          </Box> */}
+            {activeChips.map((item) => (
+              <Chip
+                key={item.key}
+                size="medium"
+                label={item.label}
+                color={"primary"}
+                onDelete={() => handleSwitchChange(item.key)} // optional: clicking X turns it off
+                sx={{
+                  "& .MuiChip-label": { fontSize: 12 },
+                }}
+              />
+            ))}
+          </Box>
 
           <MapView
             enabledLayers={enabledLayers}
             viewMode={viewMode}
-            colorBy={colorBy}
+            timeRange={timeRange}
           />
         </Box>
       </Box>
