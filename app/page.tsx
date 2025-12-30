@@ -46,9 +46,9 @@ export default function Home() {
     { key: "nr", label: "5G (NR)", char: "5G", defaultEnabled: false },
     { key: "gsm", label: "GSM", char: "GS", defaultEnabled: false },
     { key: "cdma", label: "CDMA", char: "CD", defaultEnabled: false },
-    { key: "gnss", label: "GPS (GNSS)", char: "GN", defaultEnabled: false },
+    { key: "gnss", label: "GNSS", char: "GN", defaultEnabled: false },
     // Phone state only if your backend supports it (otherwise keep disabled in UI)
-    { key: "phone", label: "Phone State", char: "PH", defaultEnabled: false },
+    // { key: "phone", label: "Phone State", char: "PH", defaultEnabled: false },
   ];
   const [timeRange, setTimeRange] = React.useState({
     start: "2025-12-19T00:00:00Z",

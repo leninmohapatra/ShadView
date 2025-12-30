@@ -3,6 +3,7 @@
 import * as React from "react";
 import Map, { NavigationControl, Source, Layer, Popup } from "react-map-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
+
 import Drawer from "@mui/material/Drawer";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
@@ -16,31 +17,38 @@ import CircularProgress from "@mui/material/CircularProgress";
 import IconButton from "@mui/material/IconButton";
 import CloseIcon from "@mui/icons-material/Close";
 
+type ViewMode = "points" | "heatmap" | "cluster"; // you can keep this for future; tiles use "points" style here
+
 type HoverInfo = {
   lng: number;
   lat: number;
-  isCluster: boolean;
   props: any;
 } | null;
 
-const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN!;
-
-type ViewMode = "points" | "heatmap" | "cluster";
-
 const API_BASE = "https://shadowview-api-963619060579.us-central1.run.app";
+const TILE_TEMPLATE = `${API_BASE}/tiles/{z}/{x}/{y}.pbf`;
+
+// Make sure this exists in your env:
+// NEXT_PUBLIC_MAPBOX_TOKEN=pk.xxx
+const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN || "";
+
+/** Format: 2025-12-19 23:57:16 UTC */
 function formatTimestampCompact(ts?: string) {
   if (!ts) return "-";
   const d = new Date(ts);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
-    2,
-    "0"
-  )}-${String(d.getUTCDate()).padStart(2, "0")}
-${String(d.getUTCHours()).padStart(2, "0")}:${String(
-    d.getUTCMinutes()
-  ).padStart(2, "0")}:${String(d.getUTCSeconds()).padStart(2, "0")} UTC`;
+  if (Number.isNaN(d.getTime())) return String(ts);
+
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
 }
 
-// Map UI keys → backend query params
+/** UI toggles -> backend filter params (tile + bbox queries use same filters) */
 function buildEventQueryParams(enabled: Record<string, boolean>) {
   const sources: string[] = [];
   const networkTypes: string[] = [];
@@ -58,11 +66,9 @@ function buildEventQueryParams(enabled: Record<string, boolean>) {
   if (enabled.gsm) sources.push("gsm_message");
   if (enabled.cdma) sources.push("cdms_message");
   if (enabled.gnss) {
-    networkTypes.push("GPS"); // 👈 THIS is the GPS filter
-    sources.push("gnss_message"); // 👈 GNSS event source
+    networkTypes.push("GPS");
+    sources.push("gnss_message");
   }
-
-  // Only keep this if your backend supports it
   if (enabled.phone) sources.push("phone_state_message");
 
   return {
@@ -72,141 +78,32 @@ function buildEventQueryParams(enabled: Record<string, boolean>) {
   };
 }
 
-// Convert backend response to GeoJSON FeatureCollection
-function toFeatureCollection(data: any) {
-  const fc =
-    data?.type === "FeatureCollection" && Array.isArray(data.features)
-      ? data
-      : {
-          type: "FeatureCollection",
-          features: (Array.isArray(data)
-            ? data
-            : Array.isArray(data?.events)
-            ? data.events
-            : []
-          )
-            .map((row: any) => {
-              const lng = row.longitude ?? row.lon ?? row.lng;
-              const lat = row.latitude ?? row.lat;
-              if (typeof lng !== "number" || typeof lat !== "number")
-                return null;
+function buildTileUrl(
+  timeRange: { start: string; end: string },
+  enabled: Record<string, boolean>
+) {
+  const { sources, networkTypes, devices } = buildEventQueryParams(enabled);
 
-              const kind =
-                row.network_type ??
-                row.networkType ??
-                row.source ??
-                row.message_type ??
-                row.messageType ??
-                "UNKNOWN";
+  const params = new URLSearchParams();
+  params.set("start_time", timeRange.start);
+  params.set("end_time", timeRange.end);
 
-              return {
-                type: "Feature",
-                geometry: { type: "Point", coordinates: [lng, lat] },
-                properties: {
-                  ...row,
-                  kind,
-                  signalStrength:
-                    row.signalStrength ??
-                    row.rssi ??
-                    row.signal_strength ??
-                    -100,
-                },
-              };
-            })
-            .filter(Boolean),
-        };
+  if (sources.length) params.set("source", sources.join(","));
+  if (networkTypes.length) params.set("network_type", networkTypes.join(","));
+  if (devices.length) params.set("device", devices.join(","));
 
-  // ✅ Ensure kind exists even if backend already sent FeatureCollection
-  const features = (fc.features ?? []).map((f: any) => {
-    const p = f?.properties ?? {};
-    const kind =
-      p.kind ??
-      p.network_type ??
-      p.networkType ??
-      p.source ??
-      p.message_type ??
-      p.messageType ??
-      "UNKNOWN";
-
-    return {
-      ...f,
-      properties: {
-        ...p,
-        kind,
-        signalStrength: p.signalStrength ?? p.rssi ?? p.signal_strength ?? -100,
-      },
-    };
-  });
-
-  return { ...fc, features };
+  // IMPORTANT: vector source expects template URL with {z}/{x}/{y}
+  return `${TILE_TEMPLATE}?${params.toString()}`;
 }
 
-/**
- * ✅ Color by "kind"
- * We color using `properties.kind`, which should be:
- * - "WIFI" (network type)
- * - or "lte_message", "bluetooth_message", "nr_message", "gnss_message", ...
- */
-const kindColorExpr: any = [
-  "match",
-  ["to-string", ["coalesce", ["get", "kind"], "UNKNOWN"]],
-
-  // Network types
-  "WIFI",
-  "#22c55e",
-  "GPS",
-  "#eab308",
-  "GALILEO",
-  "#eab308",
-  "GLONASS",
-  "#eab308",
-
-  // Sources
-  "bluetooth_message",
-  "#3b82f6",
-  "beacon_message",
-  "#06b6d4", // ✅ add (cyan pops on dark)
-  "lte_message",
-  "#f59e0b",
-  "nr_message",
-  "#a855f7",
-  "gsm_message",
-  "#ef4444",
-  "cdms_message",
-  "#14b8a6",
-  "gnss_message",
-  "#eab308",
-  "phone_state_message",
-  "#94a3b8",
-
-  // Message types (examples you showed)
-  "NrRecord",
-  "#a855f7", // ✅ add (matches 5G/NR)
-  "WifiBeaconRecord",
-  "#06b6d4", // if it appears
-  "BluetoothRecord",
-  "#3b82f6", // if it appears
-  "GnssRecord",
-  "#eab308", // if it appears
-  "LteRecord",
-  "#f59e0b", // if it appears
-  "PhoneState",
-  "#94a3b8", // if it appears
-
-  // Default
-  "#a1a1aa",
-];
-
-// Heatmap weight based on signal strength (optional)
-const heatmapWeightExpr: any = [
-  "interpolate",
-  ["linear"],
-  ["coalesce", ["get", "signalStrength"], -100],
-  -100,
-  0,
-  -60,
-  1,
-];
+function padForZoom(z: number) {
+  // degrees padding (rough heuristic) — tune
+  if (z >= 14) return 0.005;
+  if (z >= 12) return 0.01;
+  if (z >= 10) return 0.02;
+  if (z >= 8) return 0.05;
+  return 0.2;
+}
 
 export default function MapView({
   enabledLayers,
@@ -217,429 +114,417 @@ export default function MapView({
   viewMode: ViewMode;
   timeRange: { start: string; end: string };
 }) {
-  const [geo, setGeo] = React.useState<any>({
-    type: "FeatureCollection",
-    features: [],
-  });
-  const [hover, setHover] = React.useState<HoverInfo>(null);
   const mapRef = React.useRef<any>(null);
-  const [loading, setLoading] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+
+  const [hover, setHover] = React.useState<HoverInfo>(null);
+
   const [drawerOpen, setDrawerOpen] = React.useState(false);
-  const [activeClusterId, setActiveClusterId] = React.useState<number | null>(
-    null
-  );
-  const [activeClusterCount, setActiveClusterCount] = React.useState(0);
-  const [clusterPage, setClusterPage] = React.useState(1);
-  const [clusterRows, setClusterRows] = React.useState<any[]>([]);
-  const [clusterLoading, setClusterLoading] = React.useState(false);
-  const interactiveIds =
-    viewMode === "cluster"
-      ? ["events-clusters", "events-unclustered"]
-      : viewMode === "points"
-      ? ["events-points"]
-      : []; // heatmap click not needed
+  const [rowsLoading, setRowsLoading] = React.useState(false);
+  const [rowsError, setRowsError] = React.useState<string | null>(null);
+
+  const [rows, setRows] = React.useState<any[]>([]);
+  const [page, setPage] = React.useState(1);
+  const [total, setTotal] = React.useState(0);
+  const [tilesLoading, setTilesLoading] = React.useState(false);
 
   const PAGE_SIZE = 50;
 
-  // Load a page of leaves from a cluster
-  const loadClusterPage = React.useCallback(
-    (clusterId: number, count: number, page: number) => {
-      const map = mapRef.current?.getMap?.();
-      if (!map) return;
-      const src: any = map?.getSource?.("events-src");
-      if (!src || !src.getClusterLeaves) {
-        return;
-      }
-
-      setClusterLoading(true);
-
-      const offset = (page - 1) * PAGE_SIZE;
-      src.getClusterLeaves(
-        clusterId,
-        PAGE_SIZE,
-        offset,
-        (err: any, leaves: any[]) => {
-          setClusterLoading(false);
-          if (err) {
-            console.error("getClusterLeaves error:", err);
-            setClusterRows([]);
-            return;
-          }
-
-          // leaves are Features; table uses their properties
-          setActiveClusterId(clusterId);
-          setActiveClusterCount(count);
-          setClusterPage(page);
-          setClusterRows(leaves ?? []);
-          setDrawerOpen(true);
-        }
-      );
-    },
-    [mapRef]
+  // 1) Make timeRange safe (no undefined)
+  const safeTimeRange = React.useMemo(
+    () => ({
+      start:
+        timeRange?.start ??
+        new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      end: timeRange?.end ?? new Date().toISOString(),
+    }),
+    [timeRange?.start, timeRange?.end]
   );
 
-  const safeTimeRange = {
-    start:
-      timeRange?.start ??
-      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-    end: timeRange?.end ?? new Date().toISOString(),
-  };
+  // 2) Stable key to prevent unnecessary tile reloads if enabledLayers object identity changes
+  const enabledKey = React.useMemo(
+    () => JSON.stringify(enabledLayers ?? {}),
+    [enabledLayers]
+  );
 
-  const CLUSTER_FIT_MAX_ZOOM = 14;
-  const FIT_DEBOUNCE_MS = 180;
+  const tileUrl = React.useMemo(() => {
+    const enabled = JSON.parse(enabledKey);
+    return buildTileUrl(safeTimeRange, enabled);
+  }, [safeTimeRange.start, safeTimeRange.end, enabledKey]);
 
-  const vis = (mode: ViewMode) => (viewMode === mode ? "visible" : "none");
+  // Only tile layers need to be interactive
+  const interactiveLayerIds = React.useMemo(
+    () => ["tile-points", "tile-labels"],
+    []
+  );
 
-  const clusterColorExpr: any = [
-    "step",
-    ["get", "point_count"],
-    "#60a5fa", // small cluster (blue)
-    10,
-    "#34d399", // medium (green)
-    50,
-    "#fbbf24", // large (amber)
-    200,
-    "#f87171", // very large (red)
-  ];
-  const clusterRadiusExpr: any = [
-    "interpolate",
-    ["linear"],
-    ["zoom"],
+  // --- Drawer data loader (bbox + pagination) ---
+  const loadRowsByBBox = React.useCallback(
+    async (bbox: [number, number, number, number], nextPage: number) => {
+      const enabled = JSON.parse(enabledKey) as Record<string, boolean>;
+      const { sources, networkTypes, devices } = buildEventQueryParams(enabled);
 
-    8,
-    ["step", ["get", "point_count"], 10, 50, 14, 200, 18],
+      const params = new URLSearchParams();
+      params.set("start_time", safeTimeRange.start);
+      params.set("end_time", safeTimeRange.end);
 
-    12,
-    ["step", ["get", "point_count"], 12, 50, 18, 200, 24],
+      params.set("bbox", bbox.join(",")); // minLng,minLat,maxLng,maxLat
+      params.set("page", String(nextPage));
+      params.set("page_size", String(PAGE_SIZE));
 
-    16,
-    ["step", ["get", "point_count"], 14, 50, 20, 200, 26],
-  ];
+      if (sources.length) params.set("source", sources.join(","));
+      if (networkTypes.length)
+        params.set("network_type", networkTypes.join(","));
+      if (devices.length) params.set("device", devices.join(","));
 
-  // ✅ Fetch events when switches / time range changes
-  React.useEffect(() => {
-    const { sources, networkTypes, devices } =
-      buildEventQueryParams(enabledLayers);
+      const res = await fetch(`${API_BASE}/events?${params.toString()}`);
+      if (!res.ok) throw new Error(await res.text());
 
-    if (!sources.length && !networkTypes.length && !devices.length) {
-      setGeo({ type: "FeatureCollection", features: [] });
-      setLoading(false);
-      setError(null);
-      return;
-    }
+      // Expected shapes (backend may vary):
+      // A) { events: [...], total: 1234 }
+      // B) { features: [...], total: 1234 }
+      // C) { data: [...], total: 1234 }
+      // D) [...] (array)
+      const data = await res.json();
+      const list =
+        (Array.isArray(data?.events) && data.events) ||
+        (Array.isArray(data?.features) && data.features) ||
+        (Array.isArray(data?.data) && data.data) ||
+        (Array.isArray(data) && data) ||
+        [];
 
-    const controller = new AbortController();
-    setLoading(true);
-    setError(null);
+      const totalCount =
+        Number(
+          data?.total ?? data?.count ?? data?.total_count ?? list.length
+        ) || 0;
 
-    (async () => {
+      return { list, totalCount };
+    },
+    [PAGE_SIZE, enabledKey, safeTimeRange.start, safeTimeRange.end]
+  );
+
+  const openDrawerForTileFeature = React.useCallback(
+    async (feature: any, map: any) => {
+      const coords = feature?.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return;
+
+      const lng = Number(coords[0]);
+      const lat = Number(coords[1]);
+      if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+
+      const z = map.getZoom?.() ?? 10;
+      const pad = padForZoom(z);
+
+      const bbox: [number, number, number, number] = [
+        lng - pad,
+        lat - pad,
+        lng + pad,
+        lat + pad,
+      ];
+
+      setDrawerOpen(true);
+      setRowsError(null);
+      setRowsLoading(true);
+      setPage(1);
+
       try {
-        const params = new URLSearchParams();
-        params.set("start_time", safeTimeRange.start);
-        params.set("end_time", safeTimeRange.end);
-
-        // multi-select: repeat params
-        if (networkTypes.length)
-          params.set("network_type", networkTypes.join(","));
-        if (sources.length) params.set("source", sources.join(","));
-        if (devices.length) {
-          params.set("device", devices.join(",")); // or single device[0]
-        }
-
-        const url = `${API_BASE}/events?${params.toString()}`;
-        const res = await fetch(url, { signal: controller.signal });
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(`API error ${res.status}: ${text}`);
-        }
-
-        const data = await res.json();
-        setGeo(toFeatureCollection(data));
-      } catch (e: any) {
-        if (e?.name !== "AbortError") {
-          console.error(e);
-          setGeo({ type: "FeatureCollection", features: [] });
-          setError(e?.message ?? "Failed to load events");
-        }
+        const { list, totalCount } = await loadRowsByBBox(bbox, 1);
+        setRows(list);
+        setTotal(
+          // prefer backend total, fallback to tile count property if provided
+          totalCount || Number(feature?.properties?.count ?? list.length) || 0
+        );
+      } catch (err: any) {
+        setRows([]);
+        setTotal(0);
+        setRowsError(err?.message ?? "Failed to load rows");
       } finally {
-        // Don’t turn off loading for aborted requests that will be immediately replaced
-        if (!controller.signal.aborted) setLoading(false);
+        setRowsLoading(false);
       }
-    })();
+    },
+    [loadRowsByBBox]
+  );
 
-    return () => controller.abort();
-  }, [enabledLayers, safeTimeRange.start, safeTimeRange.end]);
+  // Keep last bbox so pagination can reuse it
+  const lastBBoxRef = React.useRef<[number, number, number, number] | null>(
+    null
+  );
 
-  // It automatically moves/zooms the map so that all your loaded points are visible on screen.
-  React.useEffect(() => {
-    if (!mapRef.current) return;
-
-    const t = window.setTimeout(() => {
+  const onClick = React.useCallback(
+    async (e: any) => {
       const map = mapRef.current?.getMap?.();
       if (!map) return;
 
-      const feats = geo?.features ?? [];
+      const feats = map.queryRenderedFeatures(e.point, {
+        layers: ["tile-points", "tile-labels"],
+      });
+
       if (!feats.length) return;
 
-      let minLng = Infinity,
-        minLat = Infinity,
-        maxLng = -Infinity,
-        maxLat = -Infinity;
+      const f: any = feats[0];
+      const coords = f?.geometry?.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) return;
 
-      for (const f of feats) {
+      const lng = Number(coords[0]);
+      const lat = Number(coords[1]);
+      const z = map.getZoom?.() ?? 10;
+      const pad = padForZoom(z);
+
+      const bbox: [number, number, number, number] = [
+        lng - pad,
+        lat - pad,
+        lng + pad,
+        lat + pad,
+      ];
+      lastBBoxRef.current = bbox;
+
+      await openDrawerForTileFeature(f, map);
+    },
+    [openDrawerForTileFeature]
+  );
+
+  // --- Hover (throttled) ---
+  const hoverRaf = React.useRef<number | null>(null);
+
+  const onMouseMove = React.useCallback(
+    (e: any) => {
+      const map = mapRef.current?.getMap?.();
+      if (!map) return;
+
+      if (hoverRaf.current) return;
+      hoverRaf.current = window.requestAnimationFrame(() => {
+        hoverRaf.current = null;
+
+        const feats = map.queryRenderedFeatures(e.point, {
+          layers: ["tile-points", "tile-labels"],
+        });
+
+        if (!feats.length) {
+          setHover(null);
+          map.getCanvas().style.cursor = "";
+          return;
+        }
+
+        const f: any = feats[0];
         const coords = f?.geometry?.coordinates;
-        if (!Array.isArray(coords) || coords.length < 2) continue;
+        if (!Array.isArray(coords) || coords.length < 2) {
+          setHover(null);
+          map.getCanvas().style.cursor = "";
+          return;
+        }
 
         const lng = Number(coords[0]);
         const lat = Number(coords[1]);
-        if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
 
-        minLng = Math.min(minLng, lng);
-        minLat = Math.min(minLat, lat);
-        maxLng = Math.max(maxLng, lng);
-        maxLat = Math.max(maxLat, lat);
-      }
+        map.getCanvas().style.cursor = "pointer";
+        setHover({ lng, lat, props: f.properties ?? {} });
+      });
+    },
+    [setHover]
+  );
 
-      if (!Number.isFinite(minLng) || !Number.isFinite(minLat)) return;
+  const onMouseLeave = React.useCallback(() => {
+    const map = mapRef.current?.getMap?.();
+    if (map) map.getCanvas().style.cursor = "";
+    setHover(null);
+  }, []);
 
-      if (minLng === maxLng && minLat === maxLat) {
-        const pad = 0.001;
-        minLng -= pad;
-        maxLng += pad;
-        minLat -= pad;
-        maxLat += pad;
-      }
+  // --- Tile layer styling ---
+  const tileCircleRadius: any = [
+    "interpolate",
+    ["linear"],
+    ["zoom"],
+    0,
+    2,
+    10,
+    6,
+    14,
+    10,
+  ];
 
-      map.fitBounds(
-        [
-          [minLng, minLat],
-          [maxLng, maxLat],
-        ],
-        {
-          padding: viewMode === "cluster" ? 140 : 80,
-          duration: 700,
-          maxZoom: viewMode === "cluster" ? CLUSTER_FIT_MAX_ZOOM : 22,
-        }
+  const tileCircleColor: any = [
+    "interpolate",
+    ["linear"],
+    ["coalesce", ["get", "count"], 1],
+    1,
+    "#60a5fa",
+    10,
+    "#34d399",
+    50,
+    "#fbbf24",
+    200,
+    "#f87171",
+  ];
+
+  // --- Popup dynamic counts (show only if > 0) ---
+  const renderCounts = (p: any) => {
+    const items: Array<[string, any]> = [
+      ["Wi-Fi", p?.wifiCount],
+      ["5G (NR)", p?.nrCount],
+      ["LTE", p?.lteCount],
+      ["GNSS", p?.gnssCount],
+      ["Bluetooth", p?.btCount],
+      ["GSM", p?.gsmCount],
+      ["CDMA", p?.cdmaCount],
+    ];
+
+    const filtered = items.filter(([, v]) => Number(v) > 0);
+
+    if (filtered.length) {
+      return (
+        <>
+          {filtered.map(([label, value]) => (
+            <div key={label}>
+              {label}: {Number(value)}
+            </div>
+          ))}
+        </>
       );
-    }, FIT_DEBOUNCE_MS);
+    }
 
-    return () => window.clearTimeout(t);
-  }, [geo, viewMode]);
+    // Fallback: at least show total/bucket count
+    return <div>Count: {p?.count != null ? Number(p.count) : "-"}</div>;
+  };
+
+  // Basic Mapbox token guard (prevents the “valid token required” crash loop)
+  if (!TOKEN) {
+    return (
+      <div style={{ padding: 12, color: "#e2e8f0", background: "#0b1220" }}>
+        Missing <code>NEXT_PUBLIC_MAPBOX_TOKEN</code>. Add it to your env and
+        restart.
+      </div>
+    );
+  }
+
+  const showPagination = total > PAGE_SIZE;
+  React.useEffect(() => {
+    const map = mapRef.current?.getMap?.();
+    if (!map) return;
+
+    let loadingCount = 0;
+
+    const onDataLoading = () => {
+      loadingCount++;
+      setTilesLoading(true);
+    };
+
+    const onData = () => {
+      loadingCount = Math.max(0, loadingCount - 1);
+      if (loadingCount === 0) {
+        setTilesLoading(false);
+      }
+    };
+
+    map.on("dataloading", onDataLoading);
+    map.on("data", onData);
+    map.on("idle", () => setTilesLoading(false));
+
+    return () => {
+      map.off("dataloading", onDataLoading);
+      map.off("data", onData);
+      map.off("idle", () => setTilesLoading(false));
+    };
+  }, []);
+
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      {tilesLoading && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(2,6,23,0.45)",
+            zIndex: 20,
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              background: "rgba(2,6,23,0.85)",
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(148,163,184,0.25)",
+              color: "#e2e8f0",
+              fontSize: 14,
+            }}
+          >
+            <span
+              style={{
+                width: 14,
+                height: 14,
+                borderRadius: "50%",
+                border: "2px solid rgba(255,255,255,0.35)",
+                borderTopColor: "white",
+                animation: "spin 0.8s linear infinite",
+              }}
+            />
+            Loading...
+          </div>
+        </div>
+      )}
+
       <Map
         ref={mapRef}
         mapboxAccessToken={TOKEN}
-        initialViewState={{ longitude: -88.0256, latitude: 42.1524, zoom: 12 }}
+        initialViewState={{ longitude: -88.0256, latitude: 42.1524, zoom: 5 }}
         mapStyle="mapbox://styles/mapbox/dark-v11"
         style={{ width: "100%", height: "100%" }}
-        // interactiveLayerIds={["events-clusters", "events-unclustered"]}
-        interactiveLayerIds={interactiveIds}
-        onClick={(e) => {
-          const map = mapRef.current?.getMap?.();
-          if (!map) return;
-
-          const feats = map.queryRenderedFeatures(e.point, {
-            layers: ["events-clusters", "events-unclustered"],
-          });
-
-          if (!feats.length) return;
-
-          const clusterFeature = feats.find(
-            (f: any) => f.properties?.point_count != null
-          );
-          if (clusterFeature) {
-            const clusterId = Number(clusterFeature.properties.cluster_id);
-            const count = Number(clusterFeature.properties.point_count) || 0;
-
-            loadClusterPage(clusterId, count, 1);
-            return;
-          }
-
-          const pointFeature =
-            feats.find((f: any) => f.layer?.id === "events-unclustered") ??
-            feats[0];
-
-          setActiveClusterId(null);
-          setActiveClusterCount(1);
-          setClusterPage(1);
-          setClusterRows([pointFeature]);
-          setDrawerOpen(true);
-        }}
-        onMouseMove={(e) => {
-          const map = mapRef.current?.getMap?.();
-          if (!map) return;
-
-          const feats = map.queryRenderedFeatures(e.point, {
-            layers: ["events-clusters", "events-unclustered", "events-points"],
-          });
-
-          if (!feats.length) {
-            setHover(null);
-            map.getCanvas().style.cursor = "";
-            return;
-          }
-
-          const f: any =
-            feats.find((x: any) => x.layer?.id === "events-clusters") ??
-            feats.find((x: any) => x.layer?.id === "events-unclustered") ??
-            feats[0];
-
-          map.getCanvas().style.cursor = "pointer";
-
-          const [lng, lat] = f.geometry.coordinates;
-
-          setHover({
-            lng,
-            lat,
-            isCluster: f.properties?.point_count != null,
-            props: f.properties ?? {},
-          });
-        }}
-        onMouseLeave={() => {
-          const map = mapRef.current?.getMap?.();
-          if (map) map.getCanvas().style.cursor = "";
-          setHover(null);
-        }}
+        interactiveLayerIds={interactiveLayerIds}
+        onClick={onClick}
+        onMouseMove={onMouseMove}
+        onMouseLeave={onMouseLeave}
       >
         <NavigationControl position="top-right" />
 
+        {/* Vector tile source */}
+        {/* Mapbox loads tiles incrementally as you pan/zoom */}
         <Source
-          id="events-src"
-          type="geojson"
-          data={geo}
-          cluster={true}
-          clusterRadius={40}
-          clusterMaxZoom={14}
-          clusterProperties={{
-            wifiCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "beacon_message"], 1, 0],
-            ],
-            gnssCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "gnss_message"], 1, 0],
-            ],
-            nrCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "nr_message"], 1, 0],
-            ],
-            lteCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "lte_message"], 1, 0],
-            ],
-            btCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "bluetooth_message"], 1, 0],
-            ],
-            gsmCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "gsm_message"], 1, 0],
-            ],
-            cdmaCount: [
-              "+",
-              ["case", ["==", ["get", "source"], "cdms_message"], 1, 0],
-            ],
-          }}
+          id="events-tiles"
+          type="vector"
+          tiles={[tileUrl]}
+          minzoom={0}
+          maxzoom={14}
         >
-          {/* POINTS */}
+          {/* Aggregated/bucket points from tiles */}
           <Layer
-            id="events-points"
+            id="tile-points"
             type="circle"
-            // events-points is filtered to NOT render cluster features
-            filter={["!", ["has", "point_count"]]}
-            layout={{ visibility: vis("points") }}
+            source="events-tiles"
+            source-layer="events"
             paint={{
-              "circle-radius": [
-                "interpolate",
-                ["linear"],
-                ["zoom"],
-                8,
-                3,
-                12,
-                7,
-                16,
-                10,
-              ],
-
-              "circle-color": kindColorExpr,
-              "circle-stroke-width": 1.5,
-              "circle-stroke-color": "#0f172a",
-              "circle-opacity": 0.95,
-            }}
-          />
-
-          {/* HEATMAP */}
-          <Layer
-            id="events-heatmap"
-            type="heatmap"
-            layout={{ visibility: vis("heatmap") }}
-            paint={{
-              "heatmap-weight": heatmapWeightExpr,
-              "heatmap-intensity": [
-                "interpolate",
-                ["linear"],
-                ["zoom"],
-                8,
-                1,
-                14,
-                3,
-              ],
-              "heatmap-radius": [
-                "interpolate",
-                ["linear"],
-                ["zoom"],
-                8,
-                15,
-                14,
-                35,
-              ],
-              "heatmap-opacity": 0.95,
-            }}
-          />
-
-          {/* CLUSTERS */}
-          <Layer
-            id="events-clusters"
-            type="circle"
-            filter={["has", "point_count"]}
-            // events-clusters renders only features with point_count ✅
-            layout={{ visibility: vis("cluster") }}
-            paint={{
-              "circle-color": clusterColorExpr,
-              "circle-radius": clusterRadiusExpr,
-              "circle-opacity": 0.9,
-              "circle-stroke-width": [
-                "interpolate",
-                ["linear"],
-                ["zoom"],
-                8,
-                0.5,
-                14,
-                1,
-              ],
-
+              "circle-radius": tileCircleRadius,
+              "circle-color": tileCircleColor,
+              "circle-opacity": 0.85,
+              "circle-stroke-width": 1,
               "circle-stroke-color": "#0f172a",
             }}
           />
 
-          {/* Unclustered points (cluster mode) */}
+          {/* Optional labels */}
           <Layer
-            id="events-unclustered"
-            type="circle"
-            // events-unclustered in cluster mode renders only non-cluster points ✅
-            filter={["!", ["has", "point_count"]]}
-            layout={{ visibility: vis("cluster") }}
+            id="tile-labels"
+            type="symbol"
+            source="events-tiles"
+            source-layer="events"
+            minzoom={10}
+            layout={{
+              "text-field": ["to-string", ["coalesce", ["get", "count"], 0]],
+              "text-size": 12,
+            }}
             paint={{
-              "circle-radius": 6,
-              "circle-color": kindColorExpr,
-              "circle-opacity": 0.75,
-              "circle-stroke-width": 0.5,
-              "circle-stroke-color": "#0f172a",
+              "text-color": "#0b1220",
+              "text-halo-color": "#ffffff",
+              "text-halo-width": 1,
             }}
           />
         </Source>
+
+        {/* Hover popup */}
         {hover && (
           <Popup
             longitude={hover.lng}
@@ -658,109 +543,29 @@ export default function MapView({
                 border: "1px solid rgba(148,163,184,0.25)",
                 fontSize: 14,
                 lineHeight: 1.35,
-                width: 190,
+                width: 210,
               }}
             >
-              {hover.isCluster ? (
-                <>
-                  {hover.props.wifiCount > 0 && (
-                    <div>Wi-Fi: {hover.props.wifiCount}</div>
-                  )}
-                  {hover.props.nrCount > 0 && (
-                    <div>5G (NR): {hover.props.nrCount}</div>
-                  )}
-                  {hover.props.lteCount > 0 && (
-                    <div>LTE: {hover.props.lteCount}</div>
-                  )}
-                  {hover.props.gnssCount > 0 && (
-                    <div>GNSS: {hover.props.gnssCount}</div>
-                  )}
-                  {hover.props.btCount > 0 && (
-                    <div>Bluetooth: {hover.props.btCount}</div>
-                  )}
-                  {hover.props.gsmCount > 0 && (
-                    <div>GSM: {hover.props.gsmCount}</div>
-                  )}
-                  {hover.props.cdmaCount > 0 && (
-                    <div>CDMA: {hover.props.cdmaCount}</div>
-                  )}
-                </>
-              ) : (
-                <>
-                  <div style={{ fontWeight: 700, marginBottom: 6 }}>Point</div>
-                  <div>
-                    Type: {hover.props.source ?? hover.props.kind ?? "-"}
-                  </div>
-                  <div>Device: {hover.props.device_serial_number ?? "-"}</div>
-                  <div>Time: {hover.props.timestamp ?? "-"}</div>
-                </>
-              )}
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>Bucket</div>
+              {renderCounts(hover.props)}
             </div>
           </Popup>
         )}
       </Map>
-      {(loading || error) && (
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: "rgba(2, 6, 23, 0.55)", // optional dim background
-            // pointerEvents: "auto", // 👈 CHANGE IS HERE
-            zIndex: 10,
-          }}
-        >
-          <div
-            style={{
-              pointerEvents: "auto",
-              background: "rgba(2, 6, 23, 0.85)", // dark overlay
-              color: "white",
-              padding: "10px 14px",
-              borderRadius: 12,
-              border: "1px solid rgba(148, 163, 184, 0.25)",
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              maxWidth: 360,
-            }}
-          >
-            {loading && (
-              <>
-                <span
-                  style={{
-                    width: 14,
-                    height: 14,
-                    borderRadius: "50%",
-                    border: "2px solid rgba(255,255,255,0.35)",
-                    borderTopColor: "white",
-                    display: "inline-block",
-                    animation: "spin 0.8s linear infinite",
-                  }}
-                />
-                <span>Loading...</span>
-              </>
-            )}
 
-            {!loading && error && (
-              <span style={{ color: "#fca5a5" }}>Error: {error}</span>
-            )}
-          </div>
-        </div>
-      )}
+      {/* Drawer */}
       <Drawer
-        anchor="left"
+        anchor="right"
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         PaperProps={{
           sx: {
-            width: { xs: "92vw", sm: 520, md: 550 }, // responsive width too
+            width: { xs: "92vw", sm: 520, md: 560 },
             bgcolor: "#0b1220",
             color: "#e2e8f0",
             borderRight: "1px solid rgba(148,163,184,0.15)",
 
-            // ✅ responsive top gap (adjust these to match your sidebar/header)
+            // responsive top gap (match your header/sidebar)
             top: { xs: 72, sm: 80, md: 92 },
             height: {
               xs: "calc(100% - 72px)",
@@ -769,7 +574,7 @@ export default function MapView({
             },
 
             borderTopLeftRadius: 12,
-            borderBottomLeftRadius: 12, // nice when it floats
+            borderBottomLeftRadius: 12,
             boxShadow: "0 20px 40px rgba(0,0,0,0.45)",
           },
         }}
@@ -777,12 +582,12 @@ export default function MapView({
         <Box sx={{ p: 2, display: "flex", alignItems: "center", gap: 1 }}>
           <Box sx={{ flex: 1 }}>
             <Typography sx={{ fontSize: 14, fontWeight: 600 }}>
-              {activeClusterId ? "Cluster Events" : "Event"}
+              Events
             </Typography>
             <Typography sx={{ fontSize: 12, color: "#94a3b8" }}>
-              {activeClusterId
-                ? `${activeClusterCount} total • showing ${clusterRows.length} on this page`
-                : "Details for selected point"}
+              {total
+                ? `${total} total • showing ${rows.length}`
+                : `Showing ${rows.length}`}
             </Typography>
           </Box>
 
@@ -795,9 +600,13 @@ export default function MapView({
         </Box>
 
         <Box sx={{ px: 2, pb: 1 }}>
-          {clusterLoading ? (
+          {rowsLoading ? (
             <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
               <CircularProgress size={22} />
+            </Box>
+          ) : rowsError ? (
+            <Box sx={{ color: "#fca5a5", fontSize: 12, py: 2 }}>
+              Error: {rowsError}
             </Box>
           ) : (
             <Box
@@ -810,28 +619,36 @@ export default function MapView({
               <Table size="small">
                 <TableHead>
                   <TableRow sx={{ bgcolor: "rgba(148,163,184,0.06)" }}>
-                    <TableCell sx={{ color: "#cbd5e1", fontSize: 12 }}>
+                    <TableCell
+                      sx={{ color: "#cbd5e1", fontSize: 14, fontWeight: 600 }}
+                    >
                       Time
                     </TableCell>
-                    <TableCell sx={{ color: "#cbd5e1", fontSize: 12 }}>
+                    <TableCell
+                      sx={{ color: "#cbd5e1", fontSize: 14, fontWeight: 600 }}
+                    >
                       Device
                     </TableCell>
-                    <TableCell sx={{ color: "#cbd5e1", fontSize: 12 }}>
+                    <TableCell
+                      sx={{ color: "#cbd5e1", fontSize: 14, fontWeight: 600 }}
+                    >
                       Kind
                     </TableCell>
-                    <TableCell sx={{ color: "#cbd5e1", fontSize: 12 }}>
+                    <TableCell
+                      sx={{ color: "#cbd5e1", fontSize: 14, fontWeight: 600 }}
+                    >
                       Source
                     </TableCell>
                   </TableRow>
                 </TableHead>
 
                 <TableBody>
-                  {clusterRows.map((feat: any) => {
-                    const p = feat?.properties ?? {};
+                  {rows.map((row: any, idx: number) => {
+                    // Supports either raw event objects OR GeoJSON features
+                    const p = row?.properties ?? row ?? {};
                     const time = p.timestamp
                       ? formatTimestampCompact(p.timestamp)
                       : "-";
-
                     const device = p.device_serial_number ?? p.device ?? "-";
                     const kind = p.kind ?? p.network_type ?? "-";
                     const source = p.source ?? "-";
@@ -840,11 +657,11 @@ export default function MapView({
                       <TableRow
                         key={
                           p.event_id ??
-                          `${p.timestamp}-${p.device_serial_number}-${p.source}`
+                          `${p.timestamp}-${p.device_serial_number}-${idx}`
                         }
                       >
                         <TableCell
-                          sx={{ color: "#e2e8f0", fontSize: 12, maxWidth: 160 }}
+                          sx={{ color: "#e2e8f0", fontSize: 12, maxWidth: 180 }}
                         >
                           {String(time)}
                         </TableCell>
@@ -861,7 +678,7 @@ export default function MapView({
                     );
                   })}
 
-                  {!clusterRows.length && (
+                  {!rows.length && (
                     <TableRow>
                       <TableCell
                         colSpan={4}
@@ -877,8 +694,8 @@ export default function MapView({
           )}
         </Box>
 
-        {/* Pagination only when cluster */}
-        {activeClusterId && (
+        {/* Pagination (tiles mode uses bbox paging) */}
+        {showPagination && (
           <Box
             sx={{
               px: 2,
@@ -889,11 +706,29 @@ export default function MapView({
             }}
           >
             <Pagination
-              count={Math.max(1, Math.ceil(activeClusterCount / PAGE_SIZE))}
-              page={clusterPage}
-              onChange={(_, page) => {
-                // load new page from the same cluster
-                loadClusterPage(activeClusterId, activeClusterCount, page);
+              count={Math.max(1, Math.ceil(total / PAGE_SIZE))}
+              page={page}
+              onChange={async (_, nextPage) => {
+                const bbox = lastBBoxRef.current;
+                if (!bbox) return;
+
+                setRowsLoading(true);
+                setRowsError(null);
+
+                try {
+                  const { list, totalCount } = await loadRowsByBBox(
+                    bbox,
+                    nextPage
+                  );
+                  setRows(list);
+                  setTotal(totalCount || total);
+                  setPage(nextPage);
+                } catch (err: any) {
+                  setRows([]);
+                  setRowsError(err?.message ?? "Failed to load rows");
+                } finally {
+                  setRowsLoading(false);
+                }
               }}
               size="small"
               sx={{
@@ -906,8 +741,6 @@ export default function MapView({
           </Box>
         )}
       </Drawer>
-
-      {/* CSS for spinner */}
       <style jsx>{`
         @keyframes spin {
           to {
